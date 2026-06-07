@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.obj
+
+# Runtime captures and generated reports
+diff_regions/
+focus_history/
+history/
+perf_reports/
+screenshots/
+
+# Local environment and editor files
+.env
+.env.*
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+Desktop.ini
