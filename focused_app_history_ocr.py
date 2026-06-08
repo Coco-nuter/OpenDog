@@ -2,7 +2,7 @@
 Capture focused application windows on focus switches and after user activity.
 
 Install dependencies:
-    pip install uiautomation dxcam pillow opencv-python numpy pynput rapidocr onnxruntime
+    pip install uiautomation dxcam pillow opencv-python numpy pynput paddleocr paddlepaddle
 
 Run:
     python focused_app_history_ocr.py
@@ -34,7 +34,7 @@ except ImportError as exc:
     raise SystemExit(
         "Missing dependencies. Run: "
         "pip install uiautomation dxcam pillow opencv-python numpy pynput "
-        "rapidocr onnxruntime"
+        "paddleocr paddlepaddle"
     ) from exc
 
 
@@ -56,10 +56,14 @@ class FocusedAppHistoryOCR:
         debug_all_captures: bool = False,
         max_debug_images_per_focus: int = 0,
         ocr_enabled: bool = True,
+        compare_screenshots: bool = True,
         diff_min_area: int = 100,
         diff_margin: int = 8,
-        rapidocr_min_score: float = 0.5,
-        rapidocr_limit_side_len: int = 960,
+        diff_min_ratio: float = 0.2,
+        min_window_width: int = 200,
+        min_window_height: int = 120,
+        min_diff_width: int = 100,
+        min_diff_height: int = 80,
         excluded_apps: list[str] | None = None,
     ) -> None:
         self.poll_interval = poll_interval
@@ -70,10 +74,14 @@ class FocusedAppHistoryOCR:
         self.debug_all_captures = debug_all_captures
         self.max_debug_images_per_focus = max_debug_images_per_focus
         self.ocr_enabled = ocr_enabled
+        self.compare_screenshots = compare_screenshots
         self.diff_min_area = diff_min_area
         self.diff_margin = diff_margin
-        self.rapidocr_min_score = rapidocr_min_score
-        self.rapidocr_limit_side_len = rapidocr_limit_side_len
+        self.diff_min_ratio = diff_min_ratio
+        self.min_window_width = min_window_width
+        self.min_window_height = min_window_height
+        self.min_diff_width = min_diff_width
+        self.min_diff_height = min_diff_height
         self.excluded_apps = {app.lower() for app in excluded_apps or []}
 
         self.camera: Any = None
@@ -104,24 +112,29 @@ class FocusedAppHistoryOCR:
             return
 
         try:
-            from compare_pic import RapidOCRTextRecognizer
+            from paddleocr import PaddleOCR
         except ImportError as exc:
             raise RuntimeError(
-                "Missing OCR dependency. Run: pip install rapidocr onnxruntime opencv-python"
+                "Missing OCR dependency. Run: pip install paddleocr paddlepaddle"
             ) from exc
 
         try:
-            self.ocr = RapidOCRTextRecognizer(
-                min_score=self.rapidocr_min_score,
-                use_det=True,
-                use_cls=False,
-                use_rec=True,
-                limit_side_len=self.rapidocr_limit_side_len,
-            )
+            try:
+                self.ocr = PaddleOCR(
+                    lang="ch",
+                    ocr_version="PP-OCRv4",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    device="cpu",
+                    enable_mkldnn=False,
+                )
+            except (TypeError, ValueError):
+                self.ocr = PaddleOCR(use_angle_cls=False, lang="ch", show_log=False)
         except Exception as exc:
             raise RuntimeError(
-                "RapidOCR initialization failed. Check the rapidocr/onnxruntime "
-                "installation and model availability."
+                "PaddleOCR initialization failed. Check model availability and "
+                "network access for the first download."
             ) from exc
         self.start_input_listeners()
 
@@ -191,15 +204,24 @@ class FocusedAppHistoryOCR:
 
         return "Unknown"
 
-    @staticmethod
-    def normalize_region(rect: Any, screen_width: int, screen_height: int) -> tuple[int, int, int, int] | None:
+    def normalize_region(
+        self, rect: Any, screen_width: int, screen_height: int
+    ) -> tuple[int, int, int, int] | None:
         left = max(0, int(rect.left))
         top = max(0, int(rect.top))
         right = min(screen_width, int(rect.right))
         bottom = min(screen_height, int(rect.bottom))
         if right <= left or bottom <= top:
             return None
+        if right - left < self.min_window_width or bottom - top < self.min_window_height:
+            return None
         return left, top, right, bottom
+
+    def get_window_rect_region(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        rect = ctypes.wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return self.normalize_region(rect, self.camera.width, self.camera.height)
 
     def get_focused_window(self) -> dict[str, Any] | None:
         control = auto.GetFocusedControl()
@@ -221,6 +243,8 @@ class FocusedAppHistoryOCR:
             window.BoundingRectangle, self.camera.width, self.camera.height
         )
         if region is None:
+            region = self.get_window_rect_region(hwnd)
+        if region is None:
             return None
 
         return {
@@ -237,17 +261,36 @@ class FocusedAppHistoryOCR:
             return None
         return frame
 
-    def run_ocr(self, image: np.ndarray) -> dict[str, Any]:
+    def run_ocr(self, image: np.ndarray) -> str:
         if not self.ocr_enabled:
-            return {"text": "", "ocr_items": [], "ocr_metrics": {}}
+            return ""
 
-        items = self.ocr.recognize(image)
-        text = "\n".join(item["text"] for item in items if item.get("text")).strip()
-        return {
-            "text": text,
-            "ocr_items": items,
-            "ocr_metrics": getattr(self.ocr, "last_ocr_metrics", {}),
-        }
+        if hasattr(self.ocr, "predict"):
+            result = self.ocr.predict(image)
+        else:
+            result = self.ocr.ocr(image, cls=True)
+
+        texts = []
+        for group in result or []:
+            if hasattr(group, "get"):
+                group_texts = group.get("rec_texts", [])
+                group_scores = group.get("rec_scores", [])
+                texts.extend(
+                    text
+                    for text, score in zip(group_texts, group_scores)
+                    if score >= 0.5
+                )
+                continue
+
+            for line in group or []:
+                try:
+                    text, score = line[1]
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if score >= 0.5:
+                    texts.append(text)
+
+        return "\n".join(texts).strip()
 
     def find_largest_diff_region(
         self, old_frame: np.ndarray, new_frame: np.ndarray
@@ -285,6 +328,7 @@ class FocusedAppHistoryOCR:
                 {
                     "box": [x1, y1, x2, y2],
                     "area": round(float(area), 3),
+                    "area_ratio": round(float(area) / float(width * height), 6),
                 }
             )
 
@@ -312,44 +356,62 @@ class FocusedAppHistoryOCR:
         window_info: dict[str, Any],
         frame: np.ndarray,
         trigger: str,
-    ) -> dict[str, Any]:
+        text: str | None = None,
+    ) -> dict[str, Any] | None:
         focus_id = window_info["focus_id"]
         state = self.focus_library.get(focus_id)
         directory = self.focus_directory(focus_id, window_info["app"])
         timestamp = datetime.now()
         stem = f"{timestamp.strftime('%Y%m%d_%H%M%S_%f')}_{trigger}"
-        image_path = directory / f"{stem}.png"
 
-        cv2.imwrite(str(image_path), frame)
-
+        image_to_save = frame
+        screenshot_mode = "full_frame"
         diff_box = None
         diff_area = None
-        diff_crop_path = None
-        ocr_mode = "disabled" if not self.ocr_enabled else "full_frame"
-        ocr_image = frame
+        diff_area_ratio = None
 
         old_frame = state.get("last_frame") if state is not None else None
-        if self.ocr_enabled and old_frame is not None:
+        if self.compare_screenshots and old_frame is not None:
             diff_region, diff_crop = self.find_largest_diff_region(old_frame, frame)
             if diff_region is None or diff_crop is None:
-                ocr_mode = "no_diff"
-                ocr_image = None
-            else:
-                ocr_mode = "largest_diff"
-                diff_box = diff_region["box"]
-                diff_area = diff_region["area"]
-                ocr_image = diff_crop
+                print(
+                    "[DEBUG] compare-screenshots: "
+                    f"focus_id={focus_id}, trigger={trigger}, result=no_diff"
+                )
+                if state is not None:
+                    state["last_frame"] = frame.copy()
+                return None
 
-                diff_directory = directory / "diff_regions"
-                diff_directory.mkdir(parents=True, exist_ok=True)
-                diff_crop_path = diff_directory / f"{stem}_largest_diff.png"
-                cv2.imwrite(str(diff_crop_path), diff_crop)
+            diff_height, diff_width = diff_crop.shape[:2]
+            diff_area = diff_region["area"]
+            diff_area_ratio = diff_region["area_ratio"]
+            diff_box = diff_region["box"]
+            print(
+                "[DEBUG] compare-screenshots: "
+                f"focus_id={focus_id}, trigger={trigger}, "
+                f"diff_box={diff_box}, diff_width={diff_width}, "
+                f"diff_height={diff_height}, diff_area={diff_area}, "
+                f"diff_area_ratio={diff_area_ratio}, "
+                f"min_diff_size=[{self.min_diff_width}, {self.min_diff_height}], "
+                f"diff_min_ratio={self.diff_min_ratio}"
+            )
+            if diff_width < self.min_diff_width or diff_height < self.min_diff_height:
+                if state is not None:
+                    state["last_frame"] = frame.copy()
+                return None
 
-        if ocr_image is None:
-            ocr_result = {"text": "", "ocr_items": [], "ocr_metrics": {}}
-        else:
-            ocr_result = self.run_ocr(ocr_image)
+            if diff_area_ratio < self.diff_min_ratio:
+                if state is not None:
+                    state["last_frame"] = frame.copy()
+                return None
 
+            image_to_save = diff_crop
+            screenshot_mode = "largest_diff"
+
+        image_path = directory / f"{stem}.png"
+        cv2.imwrite(str(image_path), image_to_save)
+        if text is None:
+            text = self.run_ocr(image_to_save)
         event = {
             "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
             "trigger": trigger,
@@ -359,14 +421,16 @@ class FocusedAppHistoryOCR:
             "hwnd": window_info["hwnd"],
             "region": list(window_info["region"]),
             "ocr_enabled": self.ocr_enabled,
-            "ocr_mode": ocr_mode,
-            "text": ocr_result["text"],
-            "ocr_items": ocr_result["ocr_items"],
-            "ocr_metrics": ocr_result["ocr_metrics"],
+            "text": text,
             "image_path": str(image_path),
+            "screenshot_mode": screenshot_mode,
+            "compare_screenshots": self.compare_screenshots,
             "diff_box": diff_box,
             "diff_area": diff_area,
-            "diff_crop_path": str(diff_crop_path) if diff_crop_path else None,
+            "diff_area_ratio": diff_area_ratio,
+            "diff_min_ratio": self.diff_min_ratio,
+            "min_window_size": [self.min_window_width, self.min_window_height],
+            "min_diff_size": [self.min_diff_width, self.min_diff_height],
         }
 
         with (directory / "history.jsonl").open("a", encoding="utf-8") as stream:
@@ -387,7 +451,8 @@ class FocusedAppHistoryOCR:
         window_info: dict[str, Any],
         frame: np.ndarray,
         trigger: str,
-    ) -> None:
+        text: str | None = None,
+    ) -> str:
         focus_id = window_info["focus_id"]
         directory = self.focus_directory(focus_id, window_info["app"])
         debug_directory = directory / "debug_captures"
@@ -397,6 +462,8 @@ class FocusedAppHistoryOCR:
         stem = f"{timestamp.strftime('%Y%m%d_%H%M%S_%f')}_sample"
         image_path = debug_directory / f"{stem}.png"
         cv2.imwrite(str(image_path), frame)
+        if text is None:
+            text = self.run_ocr(frame)
         record = {
             "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
             "record_type": "debug_capture",
@@ -407,6 +474,7 @@ class FocusedAppHistoryOCR:
             "hwnd": window_info["hwnd"],
             "region": list(window_info["region"]),
             "ocr_enabled": self.ocr_enabled,
+            "text": text,
             "image_path": str(image_path),
         }
 
@@ -421,7 +489,7 @@ class FocusedAppHistoryOCR:
             )
 
         self.stats["debug_captures"] += 1
-        return None
+        return text
 
     def remove_old_images(self, directory: Path, limit: int | None = None) -> None:
         if limit is None:
@@ -440,9 +508,10 @@ class FocusedAppHistoryOCR:
         if frame is None:
             return None
 
-        if self.debug_all_captures:
-            self.save_debug_capture(window_info, frame, trigger)
-        return self.save_event(window_info, frame, trigger)
+        event = self.save_event(window_info, frame, trigger)
+        if event and self.debug_all_captures:
+            self.save_debug_capture(window_info, frame, trigger, text=event["text"])
+        return event
 
     def process_once(self, now: float | None = None) -> dict[str, Any] | None:
         self.stats["samples"] += 1
@@ -531,7 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Capture focused application windows and keep OCR history."
     )
-    parser.add_argument("--poll-interval", type=float, default=0.1)
+    parser.add_argument("--poll-interval", type=float, default=0.3)
     parser.add_argument("--idle-seconds", type=float, default=1.0)
     parser.add_argument("--output-dir", default="focus_history")
     parser.add_argument("--max-memory-history", type=int, default=100)
@@ -550,31 +619,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable-ocr",
         action="store_true",
-        help="Skip RapidOCR initialization and text recognition.",
+        help="Skip PaddleOCR initialization and text recognition.",
+    )
+    parser.add_argument(
+        "--compare-screenshots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compare same-window screenshots and save only the largest diff crop.",
     )
     parser.add_argument(
         "--diff-min-area",
         type=int,
         default=100,
-        help="Minimum contour area for a screenshot diff region.",
+        help="Minimum contour area for screenshot diff extraction.",
     )
     parser.add_argument(
         "--diff-margin",
         type=int,
         default=8,
-        help="Pixels to expand around the largest diff region before OCR.",
+        help="Pixels to expand around the largest diff region.",
     )
     parser.add_argument(
-        "--rapidocr-min-score",
+        "--diff-min-ratio",
         type=float,
-        default=0.5,
-        help="Minimum RapidOCR confidence score to keep.",
+        default=0.2,
+        help="Skip same-window screenshots when the largest diff area is below this ratio.",
     )
     parser.add_argument(
-        "--rapidocr-limit-side-len",
+        "--min-window-width",
         type=int,
-        default=960,
-        help="Resize OCR input so its longest side is at most this value. Use 0 to disable.",
+        default=200,
+        help="Skip or fallback focused window regions narrower than this value.",
+    )
+    parser.add_argument(
+        "--min-window-height",
+        type=int,
+        default=120,
+        help="Skip or fallback focused window regions shorter than this value.",
+    )
+    parser.add_argument(
+        "--min-diff-width",
+        type=int,
+        default=100,
+        help="Skip largest-diff crops narrower than this value.",
+    )
+    parser.add_argument(
+        "--min-diff-height",
+        type=int,
+        default=80,
+        help="Skip largest-diff crops shorter than this value.",
     )
     parser.add_argument(
         "--exclude-app",
@@ -596,10 +689,14 @@ def main() -> int:
         debug_all_captures=args.debug_all_captures,
         max_debug_images_per_focus=args.max_debug_images_per_focus,
         ocr_enabled=not args.disable_ocr,
+        compare_screenshots=args.compare_screenshots,
         diff_min_area=args.diff_min_area,
         diff_margin=args.diff_margin,
-        rapidocr_min_score=args.rapidocr_min_score,
-        rapidocr_limit_side_len=args.rapidocr_limit_side_len,
+        diff_min_ratio=args.diff_min_ratio,
+        min_window_width=args.min_window_width,
+        min_window_height=args.min_window_height,
+        min_diff_width=args.min_diff_width,
+        min_diff_height=args.min_diff_height,
         excluded_apps=args.exclude_app,
     )
     try:
