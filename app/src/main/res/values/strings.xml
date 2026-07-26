@@ -1,0 +1,4 @@
+﻿<resources>
+    <string name="app_name">OpenDog</string>
+    <string name="accessibility_service_description">Collect current app, page, and accessibility text for OpenDog focus switch events.</string>
+</resources>
