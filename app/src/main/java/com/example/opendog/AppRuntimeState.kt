@@ -6,6 +6,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 object AppRuntimeState {
+    private val _collectionActive = MutableStateFlow(false)
+    val collectionActive: StateFlow<Boolean> = _collectionActive.asStateFlow()
+
     private val _latestSnapshot = MutableStateFlow<PageSnapshot?>(null)
     val latestSnapshot: StateFlow<PageSnapshot?> = _latestSnapshot.asStateFlow()
 
@@ -14,6 +17,10 @@ object AppRuntimeState {
 
     private val _lastServerError = MutableStateFlow("")
     val lastServerError: StateFlow<String> = _lastServerError.asStateFlow()
+
+    fun updateCollectionActive(active: Boolean) {
+        _collectionActive.value = active
+    }
 
     fun updateSnapshot(snapshot: PageSnapshot) {
         _latestSnapshot.value = snapshot

@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.view.accessibility.AccessibilityEvent
 import com.example.opendog.AppGraph
 import com.example.opendog.AppRuntimeState
+import com.example.opendog.CollectionSession
 import com.example.opendog.event.EventBuilder
 import com.example.opendog.event.PageSnapshot
 import com.example.opendog.logging.AppLogger
@@ -49,6 +50,10 @@ class OpenDogAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || !isSupportedEvent(event)) return
+        if (!CollectionSession.refreshFromAppTasks(applicationContext)) {
+            cancelPendingInteraction()
+            return
+        }
         val eventPackage = event.packageName?.toString().orEmpty()
         if (isIgnoredPackage(eventPackage)) return
 
@@ -67,9 +72,16 @@ class OpenDogAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() = Unit
 
+    override fun onTaskRemoved(rootIntent: android.content.Intent?) {
+        CollectionSession.deactivate()
+        cancelPendingInteraction()
+        lastLoggedText = ""
+        lastLoggedTextApp = null
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
-        interactionJob?.cancel()
-        interactionJob = null
+        cancelPendingInteraction()
         lastLoggedText = ""
         lastLoggedTextApp = null
         serviceScope.cancel()
@@ -91,6 +103,7 @@ class OpenDogAccessibilityService : AccessibilityService() {
         interactionJob?.cancel()
         interactionJob = serviceScope.launch {
             delay(INTERACTION_SETTLE_DELAY_MS)
+            if (!CollectionSession.refreshFromAppTasks(applicationContext)) return@launch
             val snapshot = extractCurrentSnapshot(null, includeText = true) ?: return@launch
             if (isIgnoredPackage(snapshot.packageName)) return@launch
 
@@ -112,6 +125,11 @@ class OpenDogAccessibilityService : AccessibilityService() {
                 handleUploadTrigger(snapshot)
             }
         }
+    }
+
+    private fun cancelPendingInteraction() {
+        interactionJob?.cancel()
+        interactionJob = null
     }
 
     private fun calculateTextDifference(
@@ -178,6 +196,7 @@ class OpenDogAccessibilityService : AccessibilityService() {
     }
 
     private suspend fun handleUploadTrigger(snapshot: PageSnapshot) {
+        if (!CollectionSession.refreshFromAppTasks(applicationContext)) return
         if (isIgnoredPackage(snapshot.packageName)) return
         AppRuntimeState.updateSnapshot(snapshot.withoutLocalText())
         val event = eventBuilder.buildFocusSwitch(
