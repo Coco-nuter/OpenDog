@@ -1,0 +1,13 @@
+{
+  "server_url": "http://SERVER_IP:8899",
+  "token": "replace-with-the-server-token",
+  "source": "pc_a",
+  "device_id": "windows_pc_a",
+  "history_file": "focus_history/history.jsonl",
+  "state_dir": "sync_state",
+  "batch_size": 20,
+  "flush_interval_seconds": 1,
+  "request_timeout_seconds": 15,
+  "max_retry_seconds": 60,
+  "use_proxy": false
+}

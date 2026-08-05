@@ -1,0 +1,12 @@
+{
+  "server_url": "http://SERVER_IP:8899",
+  "token": "replace-with-the-server-token",
+  "mirror_file": "mirror_events.jsonl",
+  "cursor_file": "last_seq.cursor",
+  "log_file": "logs/reader.log",
+  "batch_size": 500,
+  "request_timeout_seconds": 15,
+  "max_retries": 5,
+  "max_retry_seconds": 60,
+  "use_proxy": false
+}

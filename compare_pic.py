@@ -186,10 +186,10 @@ def extract_diff_region_data(
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
     diff = cv2.absdiff(gray1, gray2)
 
-    _, thresh = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(diff, 80, 255, cv2.THRESH_BINARY)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    thresh = cv2.dilate(thresh, kernel, iterations=3)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    thresh = cv2.dilate(thresh, kernel, iterations=5)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -232,7 +232,33 @@ def extract_diff_region_data(
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
     if text_recognizer and region_crops:
-        target_region, target_crop = max(region_crops, key=lambda item: item[0]["area"])
+        selected_region_crops = sorted(
+            region_crops, key=lambda item: item[0]["area"], reverse=True
+        )[:3]
+        selected_regions = [item[0] for item in selected_region_crops]
+        x1 = min(region["box"][0] for region in selected_regions)
+        y1 = min(region["box"][1] for region in selected_regions)
+        x2 = max(region["box"][2] for region in selected_regions)
+        y2 = max(region["box"][3] for region in selected_regions)
+        target_crop = img2[y1:y2, x1:x2]
+        target_region = {
+            "index": "top3_merged",
+            "box": [x1, y1, x2, y2],
+            "area": round(sum(region["area"] for region in selected_regions), 3),
+            "image_path": None,
+            "text": "",
+            "ocr_items": [],
+            "ocr_metrics": {},
+            "is_ocr_target": True,
+            "merged_region_count": len(selected_regions),
+            "merged_regions": selected_regions,
+        }
+        if save_images:
+            target_region["image_path"] = os.path.join(
+                output_dir, "diff_top3_merged.png"
+            )
+            cv2.imwrite(target_region["image_path"], target_crop)
+
         text_items = text_recognizer.recognize(target_crop)
         text = "\n".join(item["text"] for item in text_items).strip()
         target_region["text"] = text
@@ -242,10 +268,10 @@ def extract_diff_region_data(
             "last_ocr_metrics",
             {},
         )
-        target_region["is_ocr_target"] = True
+        regions.append(target_region)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 3)
 
         if text:
-            x1, y1, _, _ = target_region["box"]
             cv2.putText(
                 annotated,
                 text.splitlines()[0][:20],

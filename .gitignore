@@ -10,6 +10,18 @@ focus_history/
 history/
 perf_reports/
 screenshots/
+sync_state/
+server/.env
+server/data/
+
+# Contains the local server URL and bearer token.
+sync_config.json
+
+# PC B runtime data and credentials.
+pc_b_reader/config.json
+pc_b_reader/last_seq.cursor
+pc_b_reader/mirror_events.jsonl
+pc_b_reader/logs/
 
 # Local environment and editor files
 .env

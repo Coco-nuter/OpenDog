@@ -1,0 +1,24 @@
+[Unit]
+Description=OpenDog event ingest API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opendog
+Group=opendog
+WorkingDirectory=/opt/opendog-server
+EnvironmentFile=/etc/opendog-ingest.env
+ExecStart=/opt/opendog-server/.venv/bin/uvicorn app.main:app --host ${OPENDOG_HOST} --port ${OPENDOG_PORT} --workers 1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/opendog-ingest
+
+[Install]
+WantedBy=multi-user.target
