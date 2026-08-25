@@ -29,9 +29,9 @@ def load_config(config_path: Path) -> dict[str, Any]:
     missing = [key for key in required if not config.get(key)]
     if missing:
         raise ValueError(f"Missing config values: {', '.join(missing)}")
-    message_token = config.get("message_token") or config.get("token")
+    message_token = config.get("message_token")
     if not message_token:
-        raise ValueError("Missing config value: message_token or token")
+        raise ValueError("Missing config value: message_token")
     config["message_token"] = message_token
     config.setdefault("sender_id", "pc_b")
     config.setdefault("target_device_id", "windows_pc_a")

@@ -1,9 +1,11 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -13,6 +15,8 @@ from app.main import Settings, create_app
 TOKEN = "test-token-with-at-least-24-characters"
 PC_A_TOKEN = "pc-a-token-with-at-least-24-characters"
 PC_B_TOKEN = "pc-b-token-with-at-least-24-characters"
+ANDROID_TOKEN = "android-token-with-at-least-24-characters"
+ANDROID_DEVICE_ID = "android_8d5dbc33-9dbe-4a94-aa33-726e2a3458aa"
 
 
 class IngestApiTest(unittest.TestCase):
@@ -25,9 +29,11 @@ class IngestApiTest(unittest.TestCase):
                 token=TOKEN,
                 database_path=self.database_path,
                 data_dir=self.data_dir,
-                pc_a_token=PC_A_TOKEN,
                 pc_b_token=PC_B_TOKEN,
-                pc_a_device_id="windows_pc_a",
+                message_receivers={
+                    "windows_pc_a": PC_A_TOKEN,
+                    ANDROID_DEVICE_ID: ANDROID_TOKEN,
+                },
             )
         )
         self.client_context = TestClient(app)
@@ -124,6 +130,8 @@ class IngestApiTest(unittest.TestCase):
             Settings(
                 token=TOKEN,
                 database_path=self.database_path,
+                pc_b_token=PC_B_TOKEN,
+                message_receivers={"windows_pc_a": PC_A_TOKEN},
                 max_body_bytes=10,
             )
         )
@@ -315,6 +323,85 @@ class IngestApiTest(unittest.TestCase):
             headers={"Authorization": f"Bearer {PC_A_TOKEN}"},
         )
         self.assertEqual(read_wrong_target.status_code, 403)
+
+        android_payload = self.message_payload("message-android-001")
+        android_payload["target_device_id"] = ANDROID_DEVICE_ID
+        sent_to_android = self.client.post(
+            "/messages",
+            json=android_payload,
+            headers={"Authorization": f"Bearer {PC_B_TOKEN}"},
+        )
+        self.assertEqual(sent_to_android.status_code, 200)
+
+        android_pull = self.client.get(
+            "/messages/pull"
+            f"?target_device_id={ANDROID_DEVICE_ID}&after_seq=0&wait_seconds=0",
+            headers={"Authorization": f"Bearer {ANDROID_TOKEN}"},
+        )
+        self.assertEqual(android_pull.status_code, 200)
+        self.assertEqual(
+            android_pull.json()["messages"][0]["message_id"],
+            "message-android-001",
+        )
+
+        android_reading_pc_a = self.client.get(
+            "/messages/pull"
+            "?target_device_id=windows_pc_a&after_seq=0&wait_seconds=0",
+            headers={"Authorization": f"Bearer {ANDROID_TOKEN}"},
+        )
+        pc_a_reading_android = self.client.get(
+            "/messages/pull"
+            f"?target_device_id={ANDROID_DEVICE_ID}&after_seq=0&wait_seconds=0",
+            headers={"Authorization": f"Bearer {PC_A_TOKEN}"},
+        )
+        self.assertEqual(android_reading_pc_a.status_code, 403)
+        self.assertEqual(pc_a_reading_android.status_code, 403)
+
+        cross_device_ack = self.client.post(
+            "/messages/ack",
+            json={
+                "message_id": "message-android-001",
+                "target_device_id": ANDROID_DEVICE_ID,
+                "status": "shown",
+            },
+            headers={"Authorization": f"Bearer {PC_A_TOKEN}"},
+        )
+        self.assertEqual(cross_device_ack.status_code, 403)
+
+    def test_receiver_configuration_is_required_and_strict(self) -> None:
+        receivers_path = self.data_dir / "receivers.json"
+        receivers_path.write_text(
+            json.dumps({"windows_pc_a": PC_A_TOKEN}),
+            encoding="utf-8",
+        )
+        environment = {
+            "OPENDOG_TOKEN": TOKEN,
+            "OPENDOG_DATABASE_PATH": str(self.database_path),
+            "OPENDOG_PC_B_TOKEN": PC_B_TOKEN,
+            "OPENDOG_MESSAGE_RECEIVERS_FILE": str(receivers_path),
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            loaded = Settings.from_environment()
+        self.assertEqual(loaded.message_receivers, {"windows_pc_a": PC_A_TOKEN})
+
+        missing_file_environment = {
+            key: value
+            for key, value in environment.items()
+            if key != "OPENDOG_MESSAGE_RECEIVERS_FILE"
+        }
+        with patch.dict(os.environ, missing_file_environment, clear=True):
+            with self.assertRaises(RuntimeError):
+                Settings.from_environment()
+
+        receivers_path.write_text(
+            json.dumps(
+                {"windows_pc_a": PC_A_TOKEN, "android_device": PC_A_TOKEN}
+            ),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError):
+                Settings.from_environment()
 
 if __name__ == "__main__":
     unittest.main()

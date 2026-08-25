@@ -8,8 +8,13 @@ from pathlib import Path
 import uvicorn
 
 from app.main import Settings, create_app
-from pc_a_agent.receiver import acknowledge_message, append_inbox, pull_messages
-from pc_b_reader.sender import send_message
+from pc_a_agent.receiver import (
+    acknowledge_message,
+    append_inbox,
+    load_config as load_receiver_config,
+    pull_messages,
+)
+from pc_b_reader.sender import load_config as load_sender_config, send_message
 
 
 EVENT_TOKEN = "integration-event-token-1234567890"
@@ -23,6 +28,29 @@ def available_port() -> int:
         return int(sock.getsockname()[1])
 
 
+class MessageClientConfigTest(unittest.TestCase):
+    def test_event_token_is_not_used_as_message_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = Path(directory)
+            receiver_path = base_dir / "receiver.json"
+            sender_path = base_dir / "sender.json"
+            receiver_path.write_text(
+                '{"server_url":"http://localhost","device_id":"windows_pc_a",'
+                '"token":"event-token-with-at-least-24-characters"}',
+                encoding="utf-8",
+            )
+            sender_path.write_text(
+                '{"server_url":"http://localhost",'
+                '"token":"event-token-with-at-least-24-characters"}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "message_token"):
+                load_receiver_config(receiver_path)
+            with self.assertRaisesRegex(ValueError, "message_token"):
+                load_sender_config(sender_path)
+
+
 class MessageClientIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -33,9 +61,8 @@ class MessageClientIntegrationTest(unittest.TestCase):
                 token=EVENT_TOKEN,
                 database_path=self.data_dir / "indexes.sqlite3",
                 data_dir=self.data_dir,
-                pc_a_token=PC_A_TOKEN,
                 pc_b_token=PC_B_TOKEN,
-                pc_a_device_id="windows_pc_a",
+                message_receivers={"windows_pc_a": PC_A_TOKEN},
             )
         )
         config = uvicorn.Config(

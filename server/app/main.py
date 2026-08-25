@@ -19,18 +19,51 @@ from starlette.responses import JSONResponse
 
 
 DEVICE_ID_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+VALID_DEVICE_ID_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def validate_message_receivers(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or not value:
+        raise RuntimeError("Message receiver configuration must be a non-empty JSON object")
+
+    receivers: dict[str, str] = {}
+    used_tokens: set[str] = set()
+    for device_id, token in value.items():
+        if (
+            not isinstance(device_id, str)
+            or not 1 <= len(device_id) <= 128
+            or VALID_DEVICE_ID_PATTERN.fullmatch(device_id) is None
+        ):
+            raise RuntimeError(f"Invalid message receiver device ID: {device_id!r}")
+        if not isinstance(token, str) or len(token) < 24:
+            raise RuntimeError(
+                f"Message token for {device_id!r} must contain at least 24 characters"
+            )
+        if token in used_tokens:
+            raise RuntimeError("Each message receiver must use a unique token")
+        receivers[device_id] = token
+        used_tokens.add(token)
+    return receivers
+
+
+def load_message_receivers(path: Path) -> dict[str, str]:
+    try:
+        raw_value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot load message receiver configuration: {path}") from exc
+    return validate_message_receivers(raw_value)
 
 
 @dataclass(frozen=True)
 class Settings:
     token: str
     database_path: Path
+    pc_b_token: str
+    message_receivers: dict[str, str]
     data_dir: Path | None = None
     max_batch_size: int = 100
     max_body_bytes: int = 2 * 1024 * 1024
-    pc_a_token: str | None = None
-    pc_b_token: str | None = None
-    pc_a_device_id: str = "windows_pc_a"
+    message_receivers_file: Path | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -50,16 +83,15 @@ class Settings:
             )
         )
         data_dir_value = os.environ.get("OPENDOG_DATA_DIR")
-        pc_a_token = os.environ.get("OPENDOG_PC_A_TOKEN") or token
-        pc_b_token = os.environ.get("OPENDOG_PC_B_TOKEN") or token
-        pc_a_device_id = os.environ.get(
-            "OPENDOG_PC_A_DEVICE_ID",
-            "windows_pc_a",
-        )
-        if len(pc_a_token) < 24 or len(pc_b_token) < 24:
-            raise RuntimeError("PC A and PC B tokens must contain at least 24 characters")
-        if not pc_a_device_id.strip():
-            raise RuntimeError("OPENDOG_PC_A_DEVICE_ID must not be empty")
+        pc_b_token = os.environ.get("OPENDOG_PC_B_TOKEN", "")
+        if len(pc_b_token) < 24:
+            raise RuntimeError("OPENDOG_PC_B_TOKEN must contain at least 24 characters")
+
+        receivers_file_value = os.environ.get("OPENDOG_MESSAGE_RECEIVERS_FILE", "")
+        if not receivers_file_value.strip():
+            raise RuntimeError("OPENDOG_MESSAGE_RECEIVERS_FILE must not be empty")
+        receivers_file = Path(receivers_file_value)
+        message_receivers = load_message_receivers(receivers_file)
 
         return cls(
             token=token,
@@ -67,9 +99,9 @@ class Settings:
             data_dir=Path(data_dir_value) if data_dir_value else database_path.parent,
             max_batch_size=max_batch_size,
             max_body_bytes=max_body_bytes,
-            pc_a_token=pc_a_token,
             pc_b_token=pc_b_token,
-            pc_a_device_id=pc_a_device_id,
+            message_receivers=message_receivers,
+            message_receivers_file=receivers_file,
         )
 
     @property
@@ -99,14 +131,6 @@ class Settings:
     @property
     def message_targets_dir(self) -> Path:
         return self.messages_dir / "targets"
-
-    @property
-    def effective_pc_a_token(self) -> str:
-        return self.pc_a_token or self.token
-
-    @property
-    def effective_pc_b_token(self) -> str:
-        return self.pc_b_token or self.token
 
 class EventInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -811,8 +835,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         active_settings = settings or Settings.from_environment()
+        validated_receivers = validate_message_receivers(
+            active_settings.message_receivers
+        )
         initialize_storage(active_settings)
         application.state.settings = active_settings
+        application.state.message_receivers = validated_receivers
         yield
 
     application = FastAPI(
@@ -843,13 +871,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         return await call_next(request)
 
-    def require_token(authorization: str | None, expected_token: str) -> None:
+    def bearer_token(authorization: str | None) -> str:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing bearer token",
             )
-        supplied_token = authorization.removeprefix("Bearer ")
+        return authorization.removeprefix("Bearer ")
+
+    def require_token(authorization: str | None, expected_token: str) -> None:
+        supplied_token = bearer_token(authorization)
         if not hmac.compare_digest(supplied_token, expected_token):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -863,19 +894,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         active_settings: Settings = request.app.state.settings
         require_token(authorization, active_settings.token)
 
-    def authorize_pc_a(
+    def authorize_message_receiver(
         request: Request,
         authorization: str | None = Header(default=None),
-    ) -> None:
-        active_settings: Settings = request.app.state.settings
-        require_token(authorization, active_settings.effective_pc_a_token)
+    ) -> str:
+        supplied_token = bearer_token(authorization)
+        receivers: dict[str, str] = request.app.state.message_receivers
+        for device_id, expected_token in receivers.items():
+            if hmac.compare_digest(supplied_token, expected_token):
+                return device_id
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid bearer token",
+        )
 
     def authorize_pc_b(
         request: Request,
         authorization: str | None = Header(default=None),
     ) -> None:
         active_settings: Settings = request.app.state.settings
-        require_token(authorization, active_settings.effective_pc_b_token)
+        require_token(authorization, active_settings.pc_b_token)
 
     @application.get("/health")
     def health(request: Request) -> dict[str, Any]:
@@ -891,6 +929,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "service": "opendog-ingest",
             "storage": "jsonl-with-sqlite-index",
             "messages": "enabled",
+            "message_receivers": len(request.app.state.message_receivers),
         }
 
     @application.post(
@@ -988,7 +1027,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload: MessageInput,
     ) -> MessageCreateOutput:
         active_settings: Settings = request.app.state.settings
-        if payload.target_device_id != active_settings.pc_a_device_id:
+        if payload.target_device_id not in request.app.state.message_receivers:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="The sender cannot target this device",
@@ -999,7 +1038,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.get(
         "/messages/pull",
         response_model=MessagesOutput,
-        dependencies=[Depends(authorize_pc_a)],
     )
     def pull_messages(
         request: Request,
@@ -1007,9 +1045,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         after_seq: int = Query(default=0, ge=0),
         limit: int = Query(default=20, ge=1, le=100),
         wait_seconds: float = Query(default=25.0, ge=0.0, le=30.0),
+        receiver_device_id: str = Depends(authorize_message_receiver),
     ) -> MessagesOutput:
         active_settings: Settings = request.app.state.settings
-        if target_device_id != active_settings.pc_a_device_id:
+        if target_device_id != receiver_device_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="The receiver cannot read messages for this device",
@@ -1039,14 +1078,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post(
         "/messages/ack",
         response_model=MessageAckOutput,
-        dependencies=[Depends(authorize_pc_a)],
     )
     def ack_message(
         request: Request,
         payload: MessageAckInput,
+        receiver_device_id: str = Depends(authorize_message_receiver),
     ) -> MessageAckOutput:
         active_settings: Settings = request.app.state.settings
-        if payload.target_device_id != active_settings.pc_a_device_id:
+        if payload.target_device_id != receiver_device_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="The receiver cannot acknowledge messages for this device",

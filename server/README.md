@@ -235,15 +235,23 @@ sudo nano /etc/opendog-ingest.env
 
 ```text
 OPENDOG_TOKEN=replace-with-a-long-random-token
-OPENDOG_PC_A_TOKEN=replace-with-a-pc-a-message-token
 OPENDOG_PC_B_TOKEN=replace-with-a-pc-b-message-token
-OPENDOG_PC_A_DEVICE_ID=windows_pc_a
+OPENDOG_MESSAGE_RECEIVERS_FILE=/etc/opendog-message-receivers.json
 OPENDOG_DATA_DIR=/var/lib/opendog-ingest
 OPENDOG_DATABASE_PATH=/var/lib/opendog-ingest/indexes.sqlite3
 OPENDOG_MAX_BATCH_SIZE=100
 OPENDOG_MAX_BODY_BYTES=2097152
 OPENDOG_HOST=0.0.0.0
 OPENDOG_PORT=8899
+```
+
+安装接收设备表示例，并为每台设备生成不同的 Token：
+
+```bash
+sudo install -m 640 -o root -g opendog \
+  /opt/opendog-server/deploy/opendog-message-receivers.example.json \
+  /etc/opendog-message-receivers.json
+sudo nano /etc/opendog-message-receivers.json
 ```
 
 生成 token：
@@ -256,12 +264,13 @@ Token 对应关系：
 
 ```text
 OPENDOG_TOKEN       = PC A/手机上传及 PC B 读取事件使用的 token
-OPENDOG_PC_A_TOKEN  = PC A sync_config.json 中的 message_token
 OPENDOG_PC_B_TOKEN  = PC B config.json 中的 message_token
+接收设备 JSON 中 windows_pc_a 的值 = PC A sync_config.json 中的 message_token
+接收设备 JSON 中 android_设备UUID 的值 = Android 设置页中的 Message Token
 ```
 
-为了兼容原配置，如果没有设置 PC A 或 PC B 专用 Token，服务器会回退使用
-`OPENDOG_TOKEN`。正式部署建议三个 Token 分开设置。
+消息 Token 均为必填配置，不会回退使用 `OPENDOG_TOKEN`。接收设备 ID 必须唯一，
+每台接收设备的 Token 也必须不同。
 
 不要在 token 两侧加引号或空格。
 

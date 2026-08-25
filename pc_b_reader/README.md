@@ -115,8 +115,8 @@ python sender.py --config config.json --title "提醒" --body "这是一条发�
 python sender.py --config config.json --message-id "原UUID" --body "消息内容"
 ```
 
-如果服务器没有单独配置 `OPENDOG_PC_B_TOKEN`，可以省略 `message_token`，
-发送程序会兼容使用原来的 `token`。
+`message_token` 是必填项，必须与服务器的 `OPENDOG_PC_B_TOKEN` 一致；发送程序不会
+回退使用事件读取所用的 `token`。
 
 ## 重新下载全部数据
 

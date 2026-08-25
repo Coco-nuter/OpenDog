@@ -23,8 +23,8 @@ message_inbox.jsonl
 receiver.log
 ```
 
-接收器优先使用 `sync_config.json` 中的 `message_token`。没有配置时会回退使用
-原来的 `token`，以兼容只配置 `OPENDOG_TOKEN` 的服务器。
+接收器必须使用 `sync_config.json` 中独立配置的 `message_token`。这个 Token 在服务器
+接收设备表中绑定 `windows_pc_a`，不会回退使用事件上传所用的 `token`。
 
 运行 Agent 前，应先停止手动启动的 `pc_a_agent/focused_app_history_ocr.py` 和
 `pc_a_agent/syncer.py`，

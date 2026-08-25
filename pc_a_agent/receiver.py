@@ -41,9 +41,9 @@ def load_config(config_path: Path) -> dict[str, Any]:
     if missing:
         raise ValueError(f"Missing config values: {', '.join(missing)}")
 
-    message_token = config.get("message_token") or config.get("token")
+    message_token = config.get("message_token")
     if not message_token:
-        raise ValueError("Missing config value: message_token or token")
+        raise ValueError("Missing config value: message_token")
     config["message_token"] = message_token
 
     base_dir = config_path.resolve().parent
