@@ -4,6 +4,9 @@ __pycache__/
 *.pyo
 *.obj
 
+# Local Android project kept outside this repository's tracked projects.
+app_plan/
+
 # Runtime captures and generated reports
 diff_regions/
 focus_history/
@@ -22,10 +25,12 @@ pc_b_reader/config.json
 pc_b_reader/last_seq.cursor
 pc_b_reader/mirror_events.jsonl
 pc_b_reader/logs/
+pc_b_reader.zip
 
 # Local environment and editor files
 .env
 .env.*
+config_file*
 .vscode/
 .idea/
 

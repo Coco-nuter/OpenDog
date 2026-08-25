@@ -1,17 +1,17 @@
 # 桌面端采集与同步实现说明
 
-本文档整理 `focused_app_history_ocr.py` 和 `syncer.py` 的桌面端实现方式，供手机版实现相同功能时对齐数据模型、触发逻辑和同步协议。
+本文档整理 `pc_a_agent/focused_app_history_ocr.py` 和 `pc_a_agent/syncer.py` 的桌面端实现方式，供手机版实现相同功能时对齐数据模型、触发逻辑和同步协议。
 
 ## 1. 总体架构
 
 桌面端分成两个独立进程：
 
-1. `focused_app_history_ocr.py`
+1. `pc_a_agent/focused_app_history_ocr.py`
    - 负责监听用户输入、识别当前前台窗口、截屏、OCR、生成事件。
    - 将事件追加写入本地 `focus_history/history.jsonl`。
-   - 可选保存截图 PNG，但当前普通历史事件里不包含图片路径，也不会由 `syncer.py` 上传图片。
+   - 可选保存截图 PNG，但当前普通历史事件里不包含图片路径，也不会由 `pc_a_agent/syncer.py` 上传图片。
 
-2. `syncer.py`
+2. `pc_a_agent/syncer.py`
    - 负责持续读取 `history.jsonl` 新增的完整行。
    - 将本地事件转换成服务端 `/ingest` 需要的 envelope 格式。
    - 使用字节 offset 游标做断点续传。
@@ -20,7 +20,7 @@
 所以手机版可以选择两种实现路径：
 
 - 路径 A：复刻桌面端两段式流程，先写本地 JSONL，再做增量同步。
-- 路径 B：直接在手机端采集后调用 `/ingest`，但事件字段和 envelope 结构仍需与 `syncer.py` 输出保持兼容。
+- 路径 B：直接在手机端采集后调用 `/ingest`，但事件字段和 envelope 结构仍需与 `pc_a_agent/syncer.py` 输出保持兼容。
 
 ## 2. 桌面端采集方式
 
@@ -270,7 +270,7 @@ focus_history/
 
 ## 6. 本地事件格式
 
-`focused_app_history_ocr.py` 写入 JSONL 的事件格式如下：
+`pc_a_agent/focused_app_history_ocr.py` 写入 JSONL 的事件格式如下：
 
 ```json
 {
@@ -310,7 +310,7 @@ focus_history/
 
 ## 7. 同步器配置
 
-`syncer.py` 默认读取 `sync_config.json`。示例：
+`pc_a_agent/syncer.py` 默认读取 `sync_config.json`。示例：
 
 ```json
 {
@@ -500,7 +500,7 @@ Accept: application/json
 
 ## 11. 上传错误处理
 
-`syncer.py` 的错误策略：
+`pc_a_agent/syncer.py` 的错误策略：
 
 | 场景 | 处理 |
 | --- | --- |

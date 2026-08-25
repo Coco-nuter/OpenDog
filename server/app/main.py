@@ -6,11 +6,12 @@ import math
 import os
 import re
 import sqlite3
+import time
 from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -27,6 +28,9 @@ class Settings:
     data_dir: Path | None = None
     max_batch_size: int = 100
     max_body_bytes: int = 2 * 1024 * 1024
+    pc_a_token: str | None = None
+    pc_b_token: str | None = None
+    pc_a_device_id: str = "windows_pc_a"
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -46,6 +50,16 @@ class Settings:
             )
         )
         data_dir_value = os.environ.get("OPENDOG_DATA_DIR")
+        pc_a_token = os.environ.get("OPENDOG_PC_A_TOKEN") or token
+        pc_b_token = os.environ.get("OPENDOG_PC_B_TOKEN") or token
+        pc_a_device_id = os.environ.get(
+            "OPENDOG_PC_A_DEVICE_ID",
+            "windows_pc_a",
+        )
+        if len(pc_a_token) < 24 or len(pc_b_token) < 24:
+            raise RuntimeError("PC A and PC B tokens must contain at least 24 characters")
+        if not pc_a_device_id.strip():
+            raise RuntimeError("OPENDOG_PC_A_DEVICE_ID must not be empty")
 
         return cls(
             token=token,
@@ -53,6 +67,9 @@ class Settings:
             data_dir=Path(data_dir_value) if data_dir_value else database_path.parent,
             max_batch_size=max_batch_size,
             max_body_bytes=max_body_bytes,
+            pc_a_token=pc_a_token,
+            pc_b_token=pc_b_token,
+            pc_a_device_id=pc_a_device_id,
         )
 
     @property
@@ -67,6 +84,29 @@ class Settings:
     def devices_dir(self) -> Path:
         return self.storage_dir / "devices"
 
+    @property
+    def messages_dir(self) -> Path:
+        return self.storage_dir / "messages"
+
+    @property
+    def message_database_path(self) -> Path:
+        return self.messages_dir / "messages.sqlite3"
+
+    @property
+    def message_timeline_path(self) -> Path:
+        return self.messages_dir / "timeline.jsonl"
+
+    @property
+    def message_targets_dir(self) -> Path:
+        return self.messages_dir / "targets"
+
+    @property
+    def effective_pc_a_token(self) -> str:
+        return self.pc_a_token or self.token
+
+    @property
+    def effective_pc_b_token(self) -> str:
+        return self.pc_b_token or self.token
 
 class EventInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -124,6 +164,66 @@ class RangeEventsOutput(BaseModel):
     has_more: bool
 
 
+class MessageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1, max_length=128)
+    sender_id: str = Field(min_length=1, max_length=128)
+    target_device_id: str = Field(min_length=1, max_length=128)
+    message_type: Literal["popup_text"] = "popup_text"
+    title: str = Field(default="OpenDog", min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=4000)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    expires_at: float | None = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def expiry_must_be_finite(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("expires_at must be finite")
+        return value
+
+
+class MessageCreateOutput(BaseModel):
+    ok: bool = True
+    msg_seq: int
+    duplicate: bool
+
+
+class MessageOutput(BaseModel):
+    msg_seq: int
+    message_id: str
+    sender_id: str
+    target_device_id: str
+    message_type: str
+    title: str
+    body: str
+    payload: dict[str, Any]
+    created_at: str
+    expires_at: float | None
+
+
+class MessagesOutput(BaseModel):
+    ok: bool = True
+    messages: list[MessageOutput]
+    last_seq: int
+    has_more: bool
+
+
+class MessageAckInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1, max_length=128)
+    target_device_id: str = Field(min_length=1, max_length=128)
+    status: Literal["shown", "failed"]
+
+
+class MessageAckOutput(BaseModel):
+    ok: bool = True
+    message_id: str
+    status: str
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -143,6 +243,14 @@ def sanitize_device_id(device_id: str) -> str:
 
 def device_events_path(settings: Settings, device_id: str) -> Path:
     return settings.devices_dir / sanitize_device_id(device_id) / "events.jsonl"
+
+
+def target_messages_path(settings: Settings, device_id: str) -> Path:
+    return (
+        settings.message_targets_dir
+        / sanitize_device_id(device_id)
+        / "messages.jsonl"
+    )
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> tuple[int, int]:
@@ -171,6 +279,9 @@ def initialize_storage(settings: Settings) -> None:
     settings.timeline_path.parent.mkdir(parents=True, exist_ok=True)
     settings.timeline_path.touch(exist_ok=True)
     initialize_database(settings.database_path)
+    settings.message_targets_dir.mkdir(parents=True, exist_ok=True)
+    settings.message_timeline_path.touch(exist_ok=True)
+    initialize_message_database(settings.message_database_path)
 
 
 def initialize_database(database_path: Path) -> None:
@@ -201,6 +312,48 @@ def initialize_database(database_path: Path) -> None:
                 ON event_index(device_id, seq);
             CREATE INDEX IF NOT EXISTS idx_event_index_received_at
                 ON event_index(received_at);
+            """
+        )
+
+
+def initialize_message_database(database_path: Path) -> None:
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(connect_database(database_path)) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                msg_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT NOT NULL UNIQUE,
+                sender_id TEXT NOT NULL,
+                message_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS message_deliveries (
+                message_id TEXT PRIMARY KEY,
+                target_device_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                delivered_at TEXT,
+                acknowledged_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                target_path TEXT NOT NULL,
+                target_offset INTEGER NOT NULL,
+                target_length INTEGER NOT NULL,
+                timeline_offset INTEGER NOT NULL,
+                timeline_length INTEGER NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES messages(message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_delivery_target_status
+                ON message_deliveries(target_device_id, status);
+            CREATE INDEX IF NOT EXISTS idx_message_created_at
+                ON messages(created_at);
             """
         )
 
@@ -447,6 +600,213 @@ def read_events_by_time_range(
     return events, next_cursor, has_more
 
 
+def store_message(
+    settings: Settings,
+    message: MessageInput,
+) -> tuple[int, bool]:
+    created_at = utc_now()
+    target_path = target_messages_path(settings, message.target_device_id)
+
+    with closing(connect_database(settings.message_database_path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO messages (
+                message_id,
+                sender_id,
+                message_type,
+                title,
+                body,
+                payload_json,
+                created_at,
+                expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message.message_id,
+                message.sender_id,
+                message.message_type,
+                message.title,
+                message.body,
+                json.dumps(message.payload, ensure_ascii=False, separators=(",", ":")),
+                created_at,
+                message.expires_at,
+            ),
+        )
+        if cursor.rowcount == 0:
+            row = connection.execute(
+                "SELECT msg_seq FROM messages WHERE message_id = ?",
+                (message.message_id,),
+            ).fetchone()
+            connection.commit()
+            return int(row["msg_seq"]), False
+
+        msg_seq = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+        stored_message = {
+            "msg_seq": msg_seq,
+            "message_id": message.message_id,
+            "sender_id": message.sender_id,
+            "target_device_id": message.target_device_id,
+            "message_type": message.message_type,
+            "title": message.title,
+            "body": message.body,
+            "payload": message.payload,
+            "created_at": created_at,
+            "expires_at": message.expires_at,
+        }
+        target_offset, target_length = append_jsonl(target_path, stored_message)
+
+        timeline_message = {
+            "msg_seq": msg_seq,
+            "message_id": message.message_id,
+            "sender_id": message.sender_id,
+            "target_device_id": message.target_device_id,
+            "message_type": message.message_type,
+            "created_at": created_at,
+            "target_path": str(target_path.relative_to(settings.storage_dir)),
+            "offset": target_offset,
+            "length": target_length,
+        }
+        timeline_offset, timeline_length = append_jsonl(
+            settings.message_timeline_path,
+            timeline_message,
+        )
+        connection.execute(
+            """
+            INSERT INTO message_deliveries (
+                message_id,
+                target_device_id,
+                status,
+                target_path,
+                target_offset,
+                target_length,
+                timeline_offset,
+                timeline_length
+            ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
+            """,
+            (
+                message.message_id,
+                message.target_device_id,
+                str(target_path.relative_to(settings.storage_dir)),
+                target_offset,
+                target_length,
+                timeline_offset,
+                timeline_length,
+            ),
+        )
+        connection.commit()
+    return msg_seq, True
+
+
+def row_to_message(settings: Settings, row: sqlite3.Row) -> MessageOutput:
+    payload = read_jsonl_at(
+        settings.storage_dir / row["target_path"],
+        int(row["target_offset"]),
+        int(row["target_length"]),
+    )
+    return MessageOutput(**payload)
+
+
+def read_messages(
+    settings: Settings,
+    target_device_id: str,
+    after_seq: int,
+    limit: int,
+) -> tuple[list[MessageOutput], bool]:
+    now = time.time()
+    delivered_at = utc_now()
+    with closing(connect_database(settings.message_database_path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            UPDATE message_deliveries
+            SET status = 'expired'
+            WHERE target_device_id = ?
+              AND status IN ('queued', 'delivered')
+              AND message_id IN (
+                  SELECT message_id
+                  FROM messages
+                  WHERE expires_at IS NOT NULL AND expires_at <= ?
+              )
+            """,
+            (target_device_id, now),
+        )
+        rows = connection.execute(
+            """
+            SELECT
+                messages.msg_seq,
+                message_deliveries.message_id,
+                message_deliveries.target_path,
+                message_deliveries.target_offset,
+                message_deliveries.target_length
+            FROM message_deliveries
+            JOIN messages USING (message_id)
+            WHERE message_deliveries.target_device_id = ?
+              AND messages.msg_seq > ?
+              AND message_deliveries.status IN ('queued', 'delivered')
+              AND (messages.expires_at IS NULL OR messages.expires_at > ?)
+            ORDER BY messages.msg_seq ASC
+            LIMIT ?
+            """,
+            (target_device_id, after_seq, now, limit + 1),
+        ).fetchall()
+
+        page_rows = rows[:limit]
+        for row in page_rows:
+            connection.execute(
+                """
+                UPDATE message_deliveries
+                SET
+                    status = 'delivered',
+                    delivered_at = COALESCE(delivered_at, ?),
+                    attempt_count = attempt_count + 1
+                WHERE message_id = ?
+                """,
+                (delivered_at, row["message_id"]),
+            )
+        connection.commit()
+
+    return [row_to_message(settings, row) for row in page_rows], len(rows) > limit
+
+
+def acknowledge_message(
+    settings: Settings,
+    acknowledgement: MessageAckInput,
+) -> str:
+    stored_status = "acknowledged" if acknowledgement.status == "shown" else "failed"
+    acknowledged_at = utc_now()
+    with closing(connect_database(settings.message_database_path)) as connection:
+        row = connection.execute(
+            """
+            SELECT status
+            FROM message_deliveries
+            WHERE message_id = ? AND target_device_id = ?
+            """,
+            (acknowledgement.message_id, acknowledgement.target_device_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Message delivery was not found",
+            )
+        if row["status"] != "acknowledged":
+            connection.execute(
+                """
+                UPDATE message_deliveries
+                SET status = ?, acknowledged_at = ?
+                WHERE message_id = ? AND target_device_id = ?
+                """,
+                (
+                    stored_status,
+                    acknowledged_at,
+                    acknowledgement.message_id,
+                    acknowledgement.target_device_id,
+                ),
+            )
+            connection.commit()
+    return stored_status
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -457,7 +817,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     application = FastAPI(
         title="OpenDog Ingest API",
-        version="2.0.0",
+        version="3.0.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -483,38 +843,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         return await call_next(request)
 
-    def authorize(
-        request: Request,
-        authorization: str | None = Header(default=None),
-    ) -> None:
+    def require_token(authorization: str | None, expected_token: str) -> None:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing bearer token",
             )
         supplied_token = authorization.removeprefix("Bearer ")
-        active_settings: Settings = request.app.state.settings
-        if not hmac.compare_digest(supplied_token, active_settings.token):
+        if not hmac.compare_digest(supplied_token, expected_token):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid bearer token",
             )
+
+    def authorize_events(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        active_settings: Settings = request.app.state.settings
+        require_token(authorization, active_settings.token)
+
+    def authorize_pc_a(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        active_settings: Settings = request.app.state.settings
+        require_token(authorization, active_settings.effective_pc_a_token)
+
+    def authorize_pc_b(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        active_settings: Settings = request.app.state.settings
+        require_token(authorization, active_settings.effective_pc_b_token)
 
     @application.get("/health")
     def health(request: Request) -> dict[str, Any]:
         active_settings: Settings = request.app.state.settings
         with closing(connect_database(active_settings.database_path)) as connection:
             connection.execute("SELECT 1").fetchone()
+        with closing(
+            connect_database(active_settings.message_database_path)
+        ) as connection:
+            connection.execute("SELECT 1").fetchone()
         return {
             "ok": True,
             "service": "opendog-ingest",
             "storage": "jsonl-with-sqlite-index",
+            "messages": "enabled",
         }
 
     @application.post(
         "/ingest",
         response_model=IngestOutput,
-        dependencies=[Depends(authorize)],
+        dependencies=[Depends(authorize_events)],
     )
     def ingest(request: Request, payload: IngestInput) -> IngestOutput:
         active_settings: Settings = request.app.state.settings
@@ -539,7 +921,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.get(
         "/events",
         response_model=EventsOutput,
-        dependencies=[Depends(authorize)],
+        dependencies=[Depends(authorize_events)],
     )
     def events(
         request: Request,
@@ -562,7 +944,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.get(
         "/events/range",
         response_model=RangeEventsOutput,
-        dependencies=[Depends(authorize)],
+        dependencies=[Depends(authorize_events)],
     )
     def events_range(
         request: Request,
@@ -594,6 +976,85 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             events=items,
             next_cursor=next_cursor,
             has_more=has_more,
+        )
+
+    @application.post(
+        "/messages",
+        response_model=MessageCreateOutput,
+        dependencies=[Depends(authorize_pc_b)],
+    )
+    def create_message(
+        request: Request,
+        payload: MessageInput,
+    ) -> MessageCreateOutput:
+        active_settings: Settings = request.app.state.settings
+        if payload.target_device_id != active_settings.pc_a_device_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="The sender cannot target this device",
+            )
+        msg_seq, inserted = store_message(active_settings, payload)
+        return MessageCreateOutput(msg_seq=msg_seq, duplicate=not inserted)
+
+    @application.get(
+        "/messages/pull",
+        response_model=MessagesOutput,
+        dependencies=[Depends(authorize_pc_a)],
+    )
+    def pull_messages(
+        request: Request,
+        target_device_id: str = Query(..., min_length=1, max_length=128),
+        after_seq: int = Query(default=0, ge=0),
+        limit: int = Query(default=20, ge=1, le=100),
+        wait_seconds: float = Query(default=25.0, ge=0.0, le=30.0),
+    ) -> MessagesOutput:
+        active_settings: Settings = request.app.state.settings
+        if target_device_id != active_settings.pc_a_device_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="The receiver cannot read messages for this device",
+            )
+
+        deadline = time.monotonic() + wait_seconds
+        items: list[MessageOutput] = []
+        has_more = False
+        while True:
+            items, has_more = read_messages(
+                active_settings,
+                target_device_id,
+                after_seq,
+                limit,
+            )
+            if items or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+        last_seq = items[-1].msg_seq if items else after_seq
+        return MessagesOutput(
+            messages=items,
+            last_seq=last_seq,
+            has_more=has_more,
+        )
+
+    @application.post(
+        "/messages/ack",
+        response_model=MessageAckOutput,
+        dependencies=[Depends(authorize_pc_a)],
+    )
+    def ack_message(
+        request: Request,
+        payload: MessageAckInput,
+    ) -> MessageAckOutput:
+        active_settings: Settings = request.app.state.settings
+        if payload.target_device_id != active_settings.pc_a_device_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="The receiver cannot acknowledge messages for this device",
+            )
+        stored_status = acknowledge_message(active_settings, payload)
+        return MessageAckOutput(
+            message_id=payload.message_id,
+            status=stored_status,
         )
 
     return application

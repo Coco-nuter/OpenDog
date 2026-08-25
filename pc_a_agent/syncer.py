@@ -2,7 +2,7 @@
 Incrementally upload events from focus_history/history.jsonl.
 
 Run:
-    python syncer.py --config sync_config.json
+    python pc_a_agent/syncer.py --config sync_config.json
 """
 
 from __future__ import annotations

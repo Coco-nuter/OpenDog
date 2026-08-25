@@ -11,6 +11,8 @@ from app.main import Settings, create_app
 
 
 TOKEN = "test-token-with-at-least-24-characters"
+PC_A_TOKEN = "pc-a-token-with-at-least-24-characters"
+PC_B_TOKEN = "pc-b-token-with-at-least-24-characters"
 
 
 class IngestApiTest(unittest.TestCase):
@@ -23,6 +25,9 @@ class IngestApiTest(unittest.TestCase):
                 token=TOKEN,
                 database_path=self.database_path,
                 data_dir=self.data_dir,
+                pc_a_token=PC_A_TOKEN,
+                pc_b_token=PC_B_TOKEN,
+                pc_a_device_id="windows_pc_a",
             )
         )
         self.client_context = TestClient(app)
@@ -51,10 +56,23 @@ class IngestApiTest(unittest.TestCase):
             ],
         }
 
+    @staticmethod
+    def message_payload(message_id: str = "message-001") -> dict:
+        return {
+            "message_id": message_id,
+            "sender_id": "pc_b",
+            "target_device_id": "windows_pc_a",
+            "message_type": "popup_text",
+            "title": "Test message",
+            "body": "Visible message body",
+            "payload": {"origin": "unit-test"},
+        }
+
     def test_health(self) -> None:
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
+        self.assertEqual(response.json()["messages"], "enabled")
 
     def test_authentication_is_required(self) -> None:
         response = self.client.post("/ingest", json=self.payload())
@@ -215,6 +233,88 @@ class IngestApiTest(unittest.TestCase):
         )
         self.assertFalse(second_body["has_more"])
 
+    def test_message_send_pull_and_ack(self) -> None:
+        sender_headers = {"Authorization": f"Bearer {PC_B_TOKEN}"}
+        receiver_headers = {"Authorization": f"Bearer {PC_A_TOKEN}"}
+        payload = self.message_payload()
+
+        first = self.client.post("/messages", json=payload, headers=sender_headers)
+        duplicate = self.client.post(
+            "/messages",
+            json=payload,
+            headers=sender_headers,
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json(), {"ok": True, "msg_seq": 1, "duplicate": False})
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertTrue(duplicate.json()["duplicate"])
+
+        pulled = self.client.get(
+            "/messages/pull"
+            "?target_device_id=windows_pc_a&after_seq=0&limit=20&wait_seconds=0",
+            headers=receiver_headers,
+        )
+        self.assertEqual(pulled.status_code, 200)
+        message = pulled.json()["messages"][0]
+        self.assertEqual(message["body"], "Visible message body")
+        self.assertEqual(message["payload"], {"origin": "unit-test"})
+
+        acknowledged = self.client.post(
+            "/messages/ack",
+            json={
+                "message_id": "message-001",
+                "target_device_id": "windows_pc_a",
+                "status": "shown",
+            },
+            headers=receiver_headers,
+        )
+        self.assertEqual(acknowledged.status_code, 200)
+        self.assertEqual(acknowledged.json()["status"], "acknowledged")
+
+        pulled_again = self.client.get(
+            "/messages/pull"
+            "?target_device_id=windows_pc_a&after_seq=0&limit=20&wait_seconds=0",
+            headers=receiver_headers,
+        )
+        self.assertEqual(pulled_again.status_code, 200)
+        self.assertEqual(pulled_again.json()["messages"], [])
+
+        message_file = (
+            self.data_dir
+            / "messages"
+            / "targets"
+            / "windows_pc_a"
+            / "messages.jsonl"
+        )
+        self.assertTrue(message_file.exists())
+        self.assertEqual(len(message_file.read_text(encoding="utf-8").splitlines()), 1)
+        self.assertTrue((self.data_dir / "messages" / "timeline.jsonl").exists())
+
+    def test_message_tokens_and_target_are_restricted(self) -> None:
+        payload = self.message_payload()
+        missing_auth = self.client.post("/messages", json=payload)
+        wrong_role = self.client.post(
+            "/messages",
+            json=payload,
+            headers={"Authorization": f"Bearer {PC_A_TOKEN}"},
+        )
+        self.assertEqual(missing_auth.status_code, 401)
+        self.assertEqual(wrong_role.status_code, 403)
+
+        payload["target_device_id"] = "another_device"
+        wrong_target = self.client.post(
+            "/messages",
+            json=payload,
+            headers={"Authorization": f"Bearer {PC_B_TOKEN}"},
+        )
+        self.assertEqual(wrong_target.status_code, 403)
+
+        read_wrong_target = self.client.get(
+            "/messages/pull"
+            "?target_device_id=another_device&after_seq=0&wait_seconds=0",
+            headers={"Authorization": f"Bearer {PC_A_TOKEN}"},
+        )
+        self.assertEqual(read_wrong_target.status_code, 403)
 
 if __name__ == "__main__":
     unittest.main()

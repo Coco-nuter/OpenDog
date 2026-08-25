@@ -14,6 +14,9 @@ GET  /health        健康检查，不需要 token
 POST /ingest        接收事件，必须携带 Bearer Token
 GET  /events        按全局 seq 增量读取事件，必须携带 Bearer Token
 GET  /events/range  按事件时间范围读取所有设备事件，必须携带 Bearer Token
+POST /messages      PC B 向 PC A 创建消息，使用 PC B Token
+GET  /messages/pull PC A 长轮询拉取消息，使用 PC A Token
+POST /messages/ack  PC A 确认消息已经显示，使用 PC A Token
 ```
 
 ## 1. 存储结构
@@ -24,11 +27,17 @@ GET  /events/range  按事件时间范围读取所有设备事件，必须携带
 /var/lib/opendog-ingest/
 ├─ indexes.sqlite3
 ├─ timeline.jsonl
-└─ devices/
+├─ devices/
    ├─ windows_pc_a/
    │  └─ events.jsonl
    └─ android_phone/
       └─ events.jsonl
+└─ messages/
+   ├─ messages.sqlite3
+   ├─ timeline.jsonl
+   └─ targets/
+      └─ windows_pc_a/
+         └─ messages.jsonl
 ```
 
 各文件作用：
@@ -50,6 +59,10 @@ indexes.sqlite3
 ```
 
 保存索引和去重信息，不再作为完整事件主存储。
+
+`messages/messages.sqlite3` 保存消息索引、投递状态和 ACK 状态；
+`messages/timeline.jsonl` 记录所有消息进入服务器的顺序；
+`messages/targets/<device_id>/messages.jsonl` 保存目标设备的完整消息。
 
 ## 2. 写入流程
 
@@ -130,6 +143,23 @@ event_ts ASC, seq ASC
 GET /events/range?start_ts=1785150000&end_ts=1785153600&limit=500&cursor=<next_cursor>
 ```
 
+### 消息发送与接收
+
+```text
+PC B POST /messages
+        ↓
+服务器按 message_id 去重并持久化
+        ↓
+PC A GET /messages/pull 长轮询
+        ↓
+PC A 显示 MessageBoxW
+        ↓
+PC A POST /messages/ack
+```
+
+PC A 使用本地 `message_seq.cursor` 记录进度。服务器会过滤已经 ACK 的消息，
+因此网络断开后可以从原游标继续拉取。
+
 ## 4. 运行要求
 
 - Ubuntu 22.04 或 24.04
@@ -205,6 +235,9 @@ sudo nano /etc/opendog-ingest.env
 
 ```text
 OPENDOG_TOKEN=replace-with-a-long-random-token
+OPENDOG_PC_A_TOKEN=replace-with-a-pc-a-message-token
+OPENDOG_PC_B_TOKEN=replace-with-a-pc-b-message-token
+OPENDOG_PC_A_DEVICE_ID=windows_pc_a
 OPENDOG_DATA_DIR=/var/lib/opendog-ingest
 OPENDOG_DATABASE_PATH=/var/lib/opendog-ingest/indexes.sqlite3
 OPENDOG_MAX_BATCH_SIZE=100
@@ -219,12 +252,16 @@ OPENDOG_PORT=8899
 openssl rand -hex 32
 ```
 
-同一个 token 必须同时填写到：
+Token 对应关系：
 
 ```text
-服务器 /etc/opendog-ingest.env 的 OPENDOG_TOKEN
-客户端 sync_config.json 或 pc_b_reader/config.json 的 token
+OPENDOG_TOKEN       = PC A/手机上传及 PC B 读取事件使用的 token
+OPENDOG_PC_A_TOKEN  = PC A sync_config.json 中的 message_token
+OPENDOG_PC_B_TOKEN  = PC B config.json 中的 message_token
 ```
+
+为了兼容原配置，如果没有设置 PC A 或 PC B 专用 Token，服务器会回退使用
+`OPENDOG_TOKEN`。正式部署建议三个 Token 分开设置。
 
 不要在 token 两侧加引号或空格。
 
@@ -359,6 +396,33 @@ sudo sqlite3 /var/lib/opendog-ingest/indexes.sqlite3 \
 'SELECT seq,event_id,source,device_id,event_type,event_ts,device_path FROM event_index ORDER BY seq DESC LIMIT 10;'
 ```
 
+手动发送一条消息：
+
+```bash
+PC_B_TOKEN='这里填写 OPENDOG_PC_B_TOKEN'
+curl -X POST http://127.0.0.1:8899/messages \
+  -H "Authorization: Bearer ${PC_B_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "message_id":"manual-message-001",
+    "sender_id":"pc_b",
+    "target_device_id":"windows_pc_a",
+    "message_type":"popup_text",
+    "title":"测试消息",
+    "body":"服务器消息链路正常",
+    "payload":{}
+  }'
+```
+
+查看服务器消息存储：
+
+```bash
+sudo tail -n 5 /var/lib/opendog-ingest/messages/timeline.jsonl
+sudo tail -n 5 /var/lib/opendog-ingest/messages/targets/windows_pc_a/messages.jsonl
+sudo sqlite3 /var/lib/opendog-ingest/messages/messages.sqlite3 \
+'SELECT m.msg_seq,m.message_id,d.target_device_id,d.status,m.created_at FROM messages m JOIN message_deliveries d USING(message_id) ORDER BY m.msg_seq DESC LIMIT 10;'
+```
+
 ## 13. 当前版本数据兼容
 
 当前版本只使用新格式数据：
@@ -367,6 +431,9 @@ sudo sqlite3 /var/lib/opendog-ingest/indexes.sqlite3 \
 /var/lib/opendog-ingest/indexes.sqlite3
 /var/lib/opendog-ingest/timeline.jsonl
 /var/lib/opendog-ingest/devices/<device_id>/events.jsonl
+/var/lib/opendog-ingest/messages/messages.sqlite3
+/var/lib/opendog-ingest/messages/timeline.jsonl
+/var/lib/opendog-ingest/messages/targets/<device_id>/messages.jsonl
 ```
 
 服务启动时会创建缺失的目录、`timeline.jsonl` 和 SQLite 索引表，但不会迁移旧版
@@ -378,6 +445,7 @@ sudo sqlite3 /var/lib/opendog-ingest/indexes.sqlite3 \
 indexes.sqlite3
 timeline.jsonl
 devices/
+messages/
 ```
 
 如果不需要旧版 SQLite 数据，可以删除：
@@ -396,7 +464,8 @@ sudo rm -f /var/lib/opendog-ingest/events.sqlite3*
 sudo rm -f /var/lib/opendog-ingest/indexes.sqlite3*
 sudo rm -f /var/lib/opendog-ingest/timeline.jsonl
 sudo rm -rf /var/lib/opendog-ingest/devices
-sudo mkdir -p /var/lib/opendog-ingest/devices
+sudo rm -rf /var/lib/opendog-ingest/messages
+sudo mkdir -p /var/lib/opendog-ingest/devices /var/lib/opendog-ingest/messages
 sudo chown -R opendog:opendog /var/lib/opendog-ingest
 sudo systemctl start opendog-ingest
 ```
@@ -450,11 +519,13 @@ sudo du -h /var/lib/opendog-ingest
 sudo mkdir -p /var/backups/opendog-ingest
 sudo sqlite3 /var/lib/opendog-ingest/indexes.sqlite3 \
   ".backup '/var/backups/opendog-ingest/indexes-$(date +%F-%H%M%S).sqlite3'"
+sudo sqlite3 /var/lib/opendog-ingest/messages/messages.sqlite3 \
+  ".backup '/var/backups/opendog-ingest/messages-$(date +%F-%H%M%S).sqlite3'"
 ```
 
 备份 JSONL 主数据：
 
 ```bash
 sudo tar -czf "/var/backups/opendog-ingest/jsonl-$(date +%F-%H%M%S).tar.gz" \
-  -C /var/lib/opendog-ingest timeline.jsonl devices
+  -C /var/lib/opendog-ingest timeline.jsonl devices messages
 ```

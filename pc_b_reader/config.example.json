@@ -1,6 +1,9 @@
 {
   "server_url": "http://SERVER_IP:8899",
   "token": "replace-with-the-server-token",
+  "message_token": "replace-with-the-pc-b-message-token",
+  "sender_id": "pc_b",
+  "target_device_id": "windows_pc_a",
   "mirror_file": "mirror_events.jsonl",
   "cursor_file": "last_seq.cursor",
   "log_file": "logs/reader.log",

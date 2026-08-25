@@ -1,13 +1,14 @@
 # PC B 事件镜像读取器
 
-该目录只负责从 OpenDog 服务器增量下载事件并保存为本地 JSONL，不进行
-实时监听、状态切割或状态分析。
+该目录负责从 OpenDog 服务器增量下载事件，也可以向 PC A 发送弹窗消息。
+不进行实时事件分析、状态切割或状态总结。
 
 ## 文件说明
 
 ```text
 pc_b_reader/
 ├─ reader.py                 一次性增量下载程序
+├─ sender.py                 向 PC A 发送弹窗消息
 ├─ config.json               本机配置和 token，不提交到 Git
 ├─ config.example.json       配置模板
 ├─ last_seq.cursor           自动生成，最后成功保存的服务器 seq
@@ -32,6 +33,9 @@ pc_b_reader/
 {
   "server_url": "http://SERVER_IP:8899",
   "token": "与服务器OPENDOG_TOKEN相同的token",
+  "message_token": "与服务器OPENDOG_PC_B_TOKEN相同的token",
+  "sender_id": "pc_b",
+  "target_device_id": "windows_pc_a",
   "mirror_file": "mirror_events.jsonl",
   "cursor_file": "last_seq.cursor",
   "log_file": "logs/reader.log",
@@ -95,6 +99,25 @@ INFO Mirror is up to date at seq 583; downloaded 583 events
 
 后续 OpenClaw 或分析程序可以只读取这个本地文件。
 
+## 向 PC A 发送消息
+
+在 `pc_b_reader` 目录执行：
+
+```powershell
+python sender.py --config config.json --title "提醒" --body "这是一条发给 PC A 的消息"
+```
+
+脚本会生成唯一 `message_id` 并调用 `POST /messages`。网络异常时使用同一个
+`message_id` 重试，因此服务器不会重复保存。需要手动重试同一条消息时，可以
+显式传入原消息 ID：
+
+```powershell
+python sender.py --config config.json --message-id "原UUID" --body "消息内容"
+```
+
+如果服务器没有单独配置 `OPENDOG_PC_B_TOKEN`，可以省略 `message_token`，
+发送程序会兼容使用原来的 `token`。
+
 ## 重新下载全部数据
 
 这会删除 PC B 的本地镜像，不会删除服务器数据：
@@ -109,7 +132,8 @@ python reader.py --config config.json
 
 ## 故障处理
 
-- `401/403`：PC B token 与服务器 `OPENDOG_TOKEN` 不一致。
+- `/events` 返回 `401/403`：`token` 与服务器 `OPENDOG_TOKEN` 不一致。
+- `/messages` 返回 `401/403`：`message_token`、目标设备 ID 或服务器消息权限不一致。
 - `404`：服务器尚未部署新版 `/events` 接口，或 Nginx 未放行 `/events`。
 - `timed out`：检查服务器、防火墙、安全组；若系统代理干扰，保持
   `use_proxy: false`。

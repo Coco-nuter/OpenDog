@@ -1,0 +1,10 @@
+# Direct dependencies for the Windows desktop capture and OCR utilities.
+# Versions match the environment used to validate this repository.
+opencv-python==4.13.0.92
+dxcam==0.3.0
+numpy==2.3.5
+uiautomation==2.0.29
+pynput==1.8.2
+pillow==12.2.0
+rapidocr==3.8.1
+onnxruntime==1.26.0

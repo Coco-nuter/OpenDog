@@ -5,7 +5,7 @@ Install dependencies:
     pip install uiautomation dxcam pillow opencv-python numpy pynput rapidocr onnxruntime
 
 Run:
-    python focused_app_history_ocr.py
+    python pc_a_agent/focused_app_history_ocr.py
 """
 
 from __future__ import annotations
