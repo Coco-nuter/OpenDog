@@ -16,6 +16,8 @@ private val Context.openDogDataStore by preferencesDataStore(name = "opendog_con
 data class ConfigSnapshot(
     val serverBaseUrl: String = DEFAULT_SERVER_BASE_URL,
     val token: String = DEFAULT_TOKEN,
+    val messageToken: String = "",
+    val messageEnabled: Boolean = false,
     val deviceId: String = "",
     val logFocusId: Boolean = true,
     val logTitle: Boolean = true,
@@ -31,6 +33,8 @@ const val DEFAULT_TOKEN = "opendog-7c29f1b8a64edasd"
 class AppConfig(private val context: Context) {
     private val serverBaseUrlKey = stringPreferencesKey("server_base_url")
     private val tokenKey = stringPreferencesKey("token")
+    private val messageTokenKey = stringPreferencesKey("message_token")
+    private val messageEnabledKey = booleanPreferencesKey("message_enabled")
     private val deviceIdKey = stringPreferencesKey("device_id")
     private val logPageDetailsKey = booleanPreferencesKey("log_page_details")
     private val logFocusIdKey = booleanPreferencesKey("log_focus_id")
@@ -44,6 +48,8 @@ class AppConfig(private val context: Context) {
         ConfigSnapshot(
             serverBaseUrl = preferences[serverBaseUrlKey] ?: DEFAULT_SERVER_BASE_URL,
             token = preferences[tokenKey] ?: DEFAULT_TOKEN,
+            messageToken = preferences[messageTokenKey].orEmpty(),
+            messageEnabled = preferences[messageEnabledKey] ?: false,
             deviceId = preferences[deviceIdKey].orEmpty(),
             logFocusId = preferences[logFocusIdKey]
                 ?: preferences[logPageDetailsKey]
@@ -75,6 +81,18 @@ class AppConfig(private val context: Context) {
     suspend fun updateToken(value: String) {
         context.openDogDataStore.edit { preferences ->
             preferences[tokenKey] = value.trim()
+        }
+    }
+
+    suspend fun updateMessageToken(value: String) {
+        context.openDogDataStore.edit { preferences ->
+            preferences[messageTokenKey] = value.trim()
+        }
+    }
+
+    suspend fun updateMessageEnabled(value: Boolean) {
+        context.openDogDataStore.edit { preferences ->
+            preferences[messageEnabledKey] = value
         }
     }
 

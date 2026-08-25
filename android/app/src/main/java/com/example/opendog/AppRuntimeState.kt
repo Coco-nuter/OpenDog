@@ -18,6 +18,12 @@ object AppRuntimeState {
     private val _lastServerError = MutableStateFlow("")
     val lastServerError: StateFlow<String> = _lastServerError.asStateFlow()
 
+    private val _messageServiceRunning = MutableStateFlow(false)
+    val messageServiceRunning: StateFlow<Boolean> = _messageServiceRunning.asStateFlow()
+
+    private val _lastMessageError = MutableStateFlow("")
+    val lastMessageError: StateFlow<String> = _lastMessageError.asStateFlow()
+
     fun updateCollectionActive(active: Boolean) {
         _collectionActive.value = active
     }
@@ -32,5 +38,13 @@ object AppRuntimeState {
 
     fun updateServerError(error: String) {
         _lastServerError.value = error
+    }
+
+    fun updateMessageServiceRunning(running: Boolean) {
+        _messageServiceRunning.value = running
+    }
+
+    fun updateMessageError(error: String) {
+        _lastMessageError.value = error
     }
 }

@@ -1,12 +1,15 @@
 package com.example.opendog.ui
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -44,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import androidx.core.content.ContextCompat
 import com.example.opendog.AppGraph
 import com.example.opendog.CollectionSession
 import com.example.opendog.config.OcrMode
@@ -52,10 +56,25 @@ import androidx.compose.runtime.saveable.rememberSaveable
 
 class MainActivity : ComponentActivity() {
     private lateinit var mainViewModel: MainViewModel
+    private var pendingNotificationAction: NotificationAction? = null
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val action = pendingNotificationAction
+        pendingNotificationAction = null
+        if (!::mainViewModel.isInitialized) return@registerForActivityResult
+        mainViewModel.refreshNotificationPermission()
+        if (granted && action != null) {
+            performNotificationAction(action)
+        } else if (!granted) {
+            mainViewModel.onNotificationPermissionDenied()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AppGraph.init(applicationContext)
+        AppGraph.messageNotificationManager.createChannels()
         CollectionSession.activate()
         enableEdgeToEdge()
         setContent {
@@ -92,6 +111,18 @@ class MainActivity : ComponentActivity() {
                         onRefreshAccessibility = vm::refreshAccessibilityStatus,
                         onServerChanged = vm::updateServerBaseUrl,
                         onTokenChanged = vm::updateToken,
+                        onMessageTokenChanged = vm::updateMessageToken,
+                        onMessageEnabledChanged = { enabled ->
+                            if (enabled) {
+                                runWithNotificationPermission(NotificationAction.ENABLE_RECEIVER)
+                            } else {
+                                vm.disableMessageReceiver()
+                            }
+                        },
+                        onSendTestNotification = {
+                            runWithNotificationPermission(NotificationAction.SHOW_TEST)
+                        },
+                        onOpenNotificationSettings = ::openNotificationSettings,
                         onLogFocusIdChanged = vm::updateLogFocusId,
                         onLogTitleChanged = vm::updateLogTitle,
                         onLogTextChanged = vm::updateLogText,
@@ -109,8 +140,47 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         if (::mainViewModel.isInitialized) {
             mainViewModel.refreshAccessibilityStatus()
+            mainViewModel.refreshNotificationPermission()
             mainViewModel.refreshInstalledApps()
         }
+    }
+
+    private fun runWithNotificationPermission(action: NotificationAction) {
+        val granted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            performNotificationAction(action)
+        } else {
+            pendingNotificationAction = action
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    private fun performNotificationAction(action: NotificationAction) {
+        when (action) {
+            NotificationAction.ENABLE_RECEIVER -> mainViewModel.enableMessageReceiver()
+            NotificationAction.SHOW_TEST -> mainViewModel.sendTestNotification()
+        }
+    }
+
+    private fun openNotificationSettings() {
+        val notificationIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+            }
+        } else {
+            Intent("android.settings.APP_NOTIFICATION_SETTINGS").apply {
+                putExtra("app_package", packageName)
+                putExtra("app_uid", applicationInfo.uid)
+            }
+        }
+        openFirstAvailable(
+            notificationIntent,
+            appDetailsIntent()
+        )
     }
 
     private fun openBackgroundSettings() {
@@ -159,6 +229,11 @@ class MainActivity : ComponentActivity() {
         private const val HONOR_APP_LAUNCH_ACTIVITY =
             "com.hihonor.systemmanager.startupmgr.ui.StartupNormalAppListActivity"
     }
+
+    private enum class NotificationAction {
+        ENABLE_RECEIVER,
+        SHOW_TEST
+    }
 }
 
 @Composable
@@ -171,6 +246,10 @@ private fun OpenDogScreen(
     onRefreshAccessibility: () -> Unit,
     onServerChanged: (String) -> Unit,
     onTokenChanged: (String) -> Unit,
+    onMessageTokenChanged: (String) -> Unit,
+    onMessageEnabledChanged: (Boolean) -> Unit,
+    onSendTestNotification: () -> Unit,
+    onOpenNotificationSettings: () -> Unit,
     onLogFocusIdChanged: (Boolean) -> Unit,
     onLogTitleChanged: (Boolean) -> Unit,
     onLogTextChanged: (Boolean) -> Unit,
@@ -248,6 +327,42 @@ private fun OpenDogScreen(
                 label = { Text("device_id") },
                 singleLine = true
             )
+
+            HorizontalDivider()
+            SectionTitle("Messages")
+            OutlinedTextField(
+                value = state.messageToken,
+                onValueChange = onMessageTokenChanged,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Message token") },
+                visualTransformation = PasswordVisualTransformation(),
+                singleLine = true
+            )
+            LoggingSwitch(
+                label = "Enable message receiving",
+                checked = state.messageEnabled,
+                onCheckedChange = onMessageEnabledChanged
+            )
+            InfoLine(
+                "Notification permission",
+                if (state.notificationPermissionGranted) "Granted" else "Not granted"
+            )
+            InfoLine(
+                "Receiver service",
+                if (state.messageServiceRunning) "Running" else "Stopped"
+            )
+            InfoLine("Pending message actions", state.messagePendingCount.toString())
+            InfoLine("Latest message", state.latestMessageTitle)
+            InfoLine("Latest received at", state.latestMessageReceivedAt)
+            InfoLine("Last message error", state.lastMessageError)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onSendTestNotification) {
+                    Text("Test notification")
+                }
+                OutlinedButton(onClick = onOpenNotificationSettings) {
+                    Text("Notification settings")
+                }
+            }
 
             HorizontalDivider()
             SectionTitle("Logging")

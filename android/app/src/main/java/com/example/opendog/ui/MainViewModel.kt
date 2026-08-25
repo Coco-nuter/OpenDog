@@ -13,8 +13,10 @@ import com.example.opendog.AppRuntimeState
 import com.example.opendog.accessibility.OpenDogAccessibilityService
 import com.example.opendog.config.ConfigSnapshot
 import com.example.opendog.config.OcrMode
+import com.example.opendog.message.MessageReceiverController
 import com.example.opendog.network.IngestResult
 import com.example.opendog.storage.EventEntity
+import com.example.opendog.storage.message.MessageEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -27,6 +29,7 @@ import kotlinx.coroutines.withContext
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val accessibilityEnabled = MutableStateFlow(isAccessibilityServiceEnabled())
+    private val notificationPermissionGranted = MutableStateFlow(isNotificationPermissionGranted())
     private val installedApps = MutableStateFlow<List<InstalledApp>>(emptyList())
 
     val uiState: StateFlow<MainUiState> = combine(
@@ -37,7 +40,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         AppRuntimeState.lastUploadResult,
         AppRuntimeState.lastServerError,
         accessibilityEnabled,
-        installedApps
+        installedApps,
+        AppGraph.messageRepository.observeLatestMessage(),
+        AppGraph.messageRepository.observePendingCount(),
+        AppRuntimeState.messageServiceRunning,
+        AppRuntimeState.lastMessageError,
+        notificationPermissionGranted
     ) { values ->
         val config = values[0] as ConfigSnapshot
         val pendingCount = values[1] as Int
@@ -48,10 +56,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val isAccessibilityEnabled = values[6] as Boolean
         @Suppress("UNCHECKED_CAST")
         val apps = values[7] as List<InstalledApp>
+        val latestMessage = values[8] as MessageEntity?
+        val messagePendingCount = values[9] as Int
+        val messageServiceRunning = values[10] as Boolean
+        val lastMessageError = values[11] as String
+        val hasNotificationPermission = values[12] as Boolean
         MainUiState(
             accessibilityEnabled = isAccessibilityEnabled,
             serverBaseUrl = config.serverBaseUrl,
             token = config.token,
+            messageToken = config.messageToken,
+            messageEnabled = config.messageEnabled,
+            notificationPermissionGranted = hasNotificationPermission,
+            messageServiceRunning = messageServiceRunning,
+            messagePendingCount = messagePendingCount,
+            latestMessageTitle = latestMessage?.title.orEmpty(),
+            latestMessageReceivedAt = latestMessage?.notificationShownAt?.toString()
+                ?: latestMessage?.createdAt.orEmpty(),
+            lastMessageError = lastMessageError.ifBlank { latestMessage?.lastError.orEmpty() },
             logFocusId = config.logFocusId,
             logTitle = config.logTitle,
             logText = config.logText,
@@ -92,6 +114,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         accessibilityEnabled.value = isAccessibilityServiceEnabled()
     }
 
+    fun refreshNotificationPermission() {
+        notificationPermissionGranted.value = isNotificationPermissionGranted()
+    }
+
     fun refreshInstalledApps() {
         viewModelScope.launch(Dispatchers.IO) {
             val context = getApplication<Application>()
@@ -126,6 +152,59 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateToken(value: String) {
         viewModelScope.launch { AppGraph.config.updateToken(value) }
+    }
+
+    fun updateMessageToken(value: String) {
+        viewModelScope.launch { AppGraph.config.updateMessageToken(value) }
+    }
+
+    fun enableMessageReceiver() {
+        viewModelScope.launch {
+            val context = getApplication<Application>()
+            refreshNotificationPermission()
+            if (!notificationPermissionGranted.value) {
+                AppRuntimeState.updateMessageError("Notification permission is not granted")
+                return@launch
+            }
+            val config = AppGraph.config.configFlow.first()
+            val validationError = MessageReceiverController.validateConfiguration(config)
+            if (validationError != null) {
+                AppRuntimeState.updateMessageError(validationError)
+                return@launch
+            }
+            runCatching {
+                AppGraph.messageNotificationManager.createChannels()
+                AppGraph.config.updateMessageEnabled(true)
+                MessageReceiverController.start(context)
+            }.onFailure { error ->
+                AppGraph.config.updateMessageEnabled(false)
+                AppRuntimeState.updateMessageError(
+                    error.message ?: "Unable to start message receiver"
+                )
+            }
+        }
+    }
+
+    fun disableMessageReceiver() {
+        viewModelScope.launch {
+            AppGraph.config.updateMessageEnabled(false)
+            MessageReceiverController.stop(getApplication())
+            AppRuntimeState.updateMessageError("")
+        }
+    }
+
+    fun onNotificationPermissionDenied() {
+        notificationPermissionGranted.value = false
+        AppRuntimeState.updateMessageError("Notification permission is not granted")
+    }
+
+    fun sendTestNotification() {
+        refreshNotificationPermission()
+        if (AppGraph.messageNotificationManager.showTestNotification()) {
+            AppRuntimeState.updateMessageError("")
+        } else {
+            AppRuntimeState.updateMessageError("Notification permission is not granted")
+        }
     }
 
     fun updateLogFocusId(value: Boolean) {
@@ -203,6 +282,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ).orEmpty()
         return enabledServices.split(':').any { it.equals(expected, ignoreCase = true) }
+    }
+
+    private fun isNotificationPermissionGranted(): Boolean {
+        return MessageReceiverController.hasNotificationPermission(getApplication())
     }
 }
 

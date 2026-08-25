@@ -33,7 +33,7 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-buildFeatures {
+    buildFeatures {
         compose = true
     }
 }
@@ -55,6 +55,7 @@ dependencies {
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     ksp(libs.androidx.room.compiler)
     testImplementation(libs.junit)
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)
