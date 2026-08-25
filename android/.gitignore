@@ -1,0 +1,32 @@
+# Android Studio
+.idea/
+*.iml
+
+# Gradle and Kotlin caches
+.gradle/
+.kotlin/
+**/build/
+
+# Local machine configuration
+local.properties
+**/local.properties
+
+# Native build and captures
+.externalNativeBuild/
+.cxx/
+captures/
+
+# Signing credentials
+*.jks
+*.keystore
+key.properties
+
+# Local assistant and tool state
+.agents/
+.codex/
+app/.github/modernize/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
